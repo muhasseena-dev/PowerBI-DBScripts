@@ -1,0 +1,340 @@
+USE [Trinity Solar]
+GO
+/****** Object:  StoredProcedure [TSA].[SP_Create_Update_Query]    Script Date: 2021-10-20 6:35:47 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+CREATE PROCEDURE [TSA].[SP_Create_Update_Query] 
+--============== MODIFICATION LOG ==================================================
+-- DATE			RELEASE		WHO			CONTROL		MODIFICATION
+-- -----------	-------		-------		-------		--------------------------------
+-- 10/20/2021              Junaid(CitrusInformatics)   Error logging to TSA table & added RAISERROR()
+  
+--==================================================================================
+( @Schema_Name VARCHAR(10),
+  @Table_Name VARCHAR(50) ,
+  @Exec_order INT) 
+AS 
+BEGIN
+
+DECLARE @SqlQuery AS VARCHAR(MAX),@Lookup_Tables  AS VARCHAR(500),@Join_Condition AS VARCHAR(500),
+        @Join_Type AS VARCHAR(50),@Group_By_Condition AS VARCHAR(500), @Col_Definition AS VARCHAR(MAX),
+		@Col_Name VARCHAR(100),@Identity_Column VARCHAR(50),@Cycle AS INT;
+
+DECLARE @Exec_Order_Count AS INT;
+DECLARE @Row_Count AS INT=0;
+SET @Exec_Order_Count=(SELECT MAX(ISNULL(Execution_Order,0)) FROM [dbo].TSBT_bi_metadata WHERE Table_name=@Table_Name)
+DECLARE @Query_Text AS VARCHAR (MAX)
+DECLARE @Multiple_JoinQuery AS VARCHAR(MAX)  
+ 
+DECLARE @Lookp_Tables_Conditions AS TABLE 
+					(  ID INT IDENTITY(1,1),
+					   Lookup_Table_name VARCHAR(50),
+					   Join_Condition Varchar(500)
+					 )
+	
+WHILE @Exec_Order_Count>=@Row_Count
+
+BEGIN
+
+ SET @Query_Text =NULL
+ SET @Multiple_JoinQuery=NULL
+ SELECT @Query_Text = COALESCE(@Query_Text +',','') +'['+ column_name+'] = '+ CAST(column_definition AS VARCHAR(max)) FROM [dbo].tsbt_bi_metadata  
+	                  WHERE  table_name=@Table_name AND measured_calculated IN ('column','Calculated Column') AND Execution_Order=@Row_Count AND column_definition is not null
+ 
+ SELECT @Join_Condition=Join_Condition,@Lookup_Tables=Lookup_Table,@Join_Type=Join_Type,@Group_By_Condition=group_by_condition,
+        @Col_Name=column_name,@Col_Definition=column_definition,@Identity_Column=Identity_Column,@Cycle=Cycle 
+ FROM   [dbo].tsbt_bi_metadata WHERE table_name=@Table_name AND measured_calculated IN ('column','Calculated Column') AND Execution_Order=@Row_Count
+	
+	/*Check Multiple Lookup table */
+  IF(SELECT CHARINDEX(',',@Lookup_Tables))>=1 
+     BEGIN  
+        INSERT INTO @Lookp_Tables_Conditions (Lookup_Table_name,Join_Condition)
+                    SELECT SUBSTRING(Split.a.value('.', 'VARCHAR(500)'),0, CHARINDEX('.',Split.a.value('.', 'VARCHAR(500)'))),
+                     Split.a.value('.', 'VARCHAR(500)') AS Join_condition  
+                    FROM (SELECT  CAST ('<J>' + REPLACE([Join_condition], ',', '</J><J>') + '</J>' AS XML) AS Join_condition  
+                    FROM  tsbt_bi_metadata WHERE  table_name=@Table_name AND measured_calculated='column' AND Execution_Order=@Row_Count)
+	                AS A CROSS APPLY Join_condition.nodes ('/J') AS Split(a);  
+
+        SELECT @Multiple_JoinQuery = COALESCE(@Multiple_JoinQuery +ISNULL(@Join_Type,' INNER ')+' JOIN ',ISNULL(@Join_Type,' INNER ')+' JOIN ') +@Schema_Name+'.'+Lookup_Table_name+' ON '
+                                     + CAST(Join_Condition AS VARCHAR(MAX)) FROM @Lookp_Tables_Conditions
+       END
+
+	IF (@Lookup_Tables IS NULL)	   
+	   SET @SqlQuery='UPDATE ['+@Schema_Name+'].['+@Table_Name+'] SET '+@Query_Text+' FROM ['+@Schema_Name+'].['+ @Table_name+']  ';
+ 	ELSE IF (@Lookup_Tables IS NOT NULL AND @Multiple_JoinQuery IS NULL)
+	   SET @SqlQuery='UPDATE ['+@Schema_Name+'].['+@Table_name+'] SET '+@Query_Text+ ' FROM ['+@Schema_Name+'].['+ @Table_name+']  '+ISNULL(@Join_Type,'INNER ')+' JOIN '+@Schema_Name+'.'+@Lookup_Tables+' ON '+@Join_Condition;
+	ELSE IF (@Lookup_Tables IS NOT NULL AND @Multiple_JoinQuery IS NOT NULL)
+	   SET @SqlQuery='UPDATE ['+@Schema_Name+'].['+@Table_name+'] SET '+@Query_Text+ ' FROM ['+@Schema_Name+'].['+ @Table_name+']  '+@Multiple_JoinQuery;
+					
+   IF(@Group_By_Condition IS NOT NULL OR LEN(@Group_By_Condition)>1)
+   BEGIN
+    IF(@Group_By_Condition  LIKE '%' + @Table_name+'.'+@Identity_Column  + '%')
+	BEGIN
+      SET @SqlQuery=' WITH '+@Lookup_Tables+' AS (SELECT '+@Group_By_Condition+','+@Col_Definition+ ' AS '+@Col_Name+ ' FROM '+ @Schema_Name+'.['+@Table_Name+'](nolock)'+ ISNULL(@Join_Type,'INNER ')+' JOIN '+
+					@Schema_Name+'.'+@Lookup_Tables+'(nolock) ON '+ @Join_Condition +' GROUP BY '+@Group_By_Condition+') UPDATE '+@Schema_Name+'.['+@Table_Name+ '] SET ' +@Col_Name+
+				    '= '+@Lookup_Tables+'.'+@Col_Name +' FROM '+@Lookup_Tables+' INNER JOIN '+@Schema_Name+'.'+@Table_Name+ ' ON '+@Table_Name+'.'+@Identity_Column+'='+@Lookup_Tables+'.'+@Identity_Column;
+  
+   END
+   ELSE
+     SET @SqlQuery=' WITH '+@Lookup_Tables+' AS (SELECT '+@Table_name+'.'+@Identity_Column +','+@Group_By_Condition+','+@Col_Definition+ ' AS '+@Col_Name+ ' FROM '+ @Schema_Name+'.['+@Table_Name+'](nolock)'+ ISNULL(@Join_Type,'INNER ')+' JOIN '+
+					@Schema_Name+'.'+@Lookup_Tables+'(nolock) ON '+ @Join_Condition +' GROUP BY '+@Group_By_Condition+','+@Table_name+'.'+@Identity_Column+') UPDATE '+@Schema_Name+'.['+@Table_Name+ '] SET ' +@Col_Name+
+				    '= '+@Lookup_Tables+'.'+@Col_Name +' FROM '+@Lookup_Tables+' INNER JOIN '+@Schema_Name+'.'+@Table_Name+ ' ON '+@Table_Name+'.'+@Identity_Column+'='+@Lookup_Tables+'.'+@Identity_Column;
+   
+   END		
+   IF(LEN(@SqlQuery)>0)
+	 BEGIN	
+	   DELETE FROM [TSA].[update_query_metadata] WHERE Table_Name=@Table_name AND Execution_Order=@Row_Count AND Cycle=@Cycle
+       IF(@Exec_order IS NULL)
+	      INSERT INTO [TSA].[update_query_metadata](Table_Name,Query_Text,Execution_Order,Cycle) VALUES(@Table_name,@SqlQuery,@Row_Count,@Cycle)
+       ELSE IF(@Exec_order IS NOT NULL)
+	     BEGIN
+          IF(@Exec_order=@Row_Count)
+	      INSERT INTO [TSA].[update_query_metadata](Table_Name,Query_Text,Execution_Order,Cycle) VALUES(@Table_name,@SqlQuery,@Row_Count,@Cycle)
+	     END
+	    			
+      SET @SqlQuery=null
+	  SET @Query_Text='';
+	  SET @Multiple_JoinQuery='';
+    END
+	  SET @Row_Count=@Row_Count+1;
+  END
+END       
+GO
+/****** Object:  StoredProcedure [TSA].[SP_Create_Update_Query_All_Tables]    Script Date: 2021-10-20 6:35:47 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+CREATE PROCEDURE [TSA].[SP_Create_Update_Query_All_Tables]
+--============== MODIFICATION LOG ==================================================
+-- DATE			RELEASE		WHO			CONTROL		MODIFICATION
+-- -----------	-------		-------		-------		--------------------------------
+-- 10/20/2021              Junaid(CitrusInformatics)   Error logging to TSA table & added RAISERROR()
+  
+--==================================================================================
+
+AS
+BEGIN
+
+  TRUNCATE TABLE TSA.Update_Query_Metadata;
+  EXEC [TSA].[SP_Create_Update_Query] 'TSA','User',NULL;
+  EXEC [TSA].[SP_Create_Update_Query] 'TSA','Contact',NULL;
+  EXEC [TSA].[SP_Create_Update_Query] 'TSA','Account',NULL;
+  EXEC [TSA].[SP_Create_Update_Query] 'TSA','Task',NULL;
+  EXEC [TSA].[SP_Create_Update_Query] 'TSA','Opportunity',NULL;
+  EXEC [TSA].[SP_Create_Update_Query] 'TSA','Check_Request',NULL;  
+  EXEC [TSA].[SP_Create_Update_Query] 'TSA','Action_Item',NULL;
+  EXEC [TSA].[SP_Create_Update_Query] 'TSA','Project_Track',NULL;
+  EXEC [TSA].[SP_Create_Update_Query] 'TSA','Event',NULL;
+  EXEC [TSA].[SP_Create_Update_Query] 'TSA','Lead',NULL;
+
+IF NOT EXISTS (SELECT LastLoadDate FROM TSA.SalesForceControlTable_Log)
+  BEGIN
+    INSERT INTO TSA.SalesForceControlTable_Log (SourceObject,LastLoadDate) VALUES('User','1900-01-01 00:00:00.000')
+    INSERT INTO TSA.SalesForceControlTable_Log (SourceObject,LastLoadDate) VALUES('Contact','1900-01-01 00:00:00.000')
+    INSERT INTO TSA.SalesForceControlTable_Log (SourceObject,LastLoadDate) VALUES('Account','1900-01-01 00:00:00.000')
+    INSERT INTO TSA.SalesForceControlTable_Log (SourceObject,LastLoadDate) VALUES('Task','1900-01-01 00:00:00.000')
+    INSERT INTO TSA.SalesForceControlTable_Log (SourceObject,LastLoadDate) VALUES('Opportunity','1900-01-01 00:00:00.000')
+    INSERT INTO TSA.SalesForceControlTable_Log (SourceObject,LastLoadDate) VALUES('Action_Item','1900-01-01 00:00:00.000')
+    INSERT INTO TSA.SalesForceControlTable_Log (SourceObject,LastLoadDate) VALUES('Project_Track','1900-01-01 00:00:00.000')
+    INSERT INTO TSA.SalesForceControlTable_Log (SourceObject,LastLoadDate) VALUES('Event','1900-01-01 00:00:00.000')
+    INSERT INTO TSA.SalesForceControlTable_Log (SourceObject,LastLoadDate) VALUES('Lead','1900-01-01 00:00:00.000')
+    INSERT INTO TSA.SalesForceControlTable_Log (SourceObject,LastLoadDate) VALUES('Check_Request','1900-01-01 00:00:00.000')
+  END
+
+END
+
+GO
+/****** Object:  StoredProcedure [TSA].[Update_Calculated_Cols]    Script Date: 2021-10-20 6:35:47 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+  
+  
+  
+CREATE PROCEDURE [TSA].[Update_Calculated_Cols] 
+--[TSA].[Update_Calculated_cols] 'TSA', 'ACCOUNT' ,1 ,NULL
+--============== MODIFICATION LOG ==================================================
+-- DATE			RELEASE		WHO			CONTROL		MODIFICATION
+-- -----------	-------		-------		-------		--------------------------------
+-- 10/20/2021              Junaid(CitrusInformatics)   
+  
+--==================================================================================
+
+( @Schema_Name VARCHAR(10),
+  @Table_name AS VARCHAR(100),
+  @Cycle INT ,
+  @From_date DATETIME = NULL)  
+AS  
+BEGIN  
+BEGIN TRY
+
+DECLARE @SqlQuery AS VARCHAR(MAX),@SQLQuery1  AS VARCHAR(MAX);
+DECLARE @Exec_Order_Count AS INT;  
+DECLARE @Row_Count AS INT=0;  
+DECLARE @MAX_Rws_Count AS INT;  
+SET @Exec_Order_Count=(SELECT MAX(ISNULL(Execution_Order,0)) FROM [TSA].[update_query_metadata] WHERE Table_name=@Table_Name)  
+DECLARE @LastLoadDate AS DATETIME,@Week_Before_Date AS DATETIME
+SET @LastLoadDate=(SELECT CASE WHEN DATEPART(YEAR,MAX([LastLoadDate]))='1900' THEN '1900-01-01 00:00:00.000' WHEN @From_date IS NOT NULL THEN @From_date ELSE DATEADD(DAY, -3, MAX([LastLoadDate])) END FROM [TSA].[SalesForceControlTable_Log] where [SourceObject]=+@Table_name)
+SET @Week_Before_Date=(SELECT CASE WHEN DATEPART(YEAR,MAX([LastLoadDate]))='1900' THEN '1900-01-01 00:00:00.000' WHEN @From_date IS NOT NULL THEN @From_date  ELSE DATEADD(DAY, -7, MAX([LastLoadDate])) END FROM [TSA].[SalesForceControlTable_Log] where [SourceObject]=+@Table_name)
+
+----insert to salesforce control table log
+DELETE  FROM [TSA].[SalesForceControlTable_Log] WHERE LastLoadDate< DATEADD(DAY,-3,GETDATE()) AND DATEPART(YEAR,LastLoadDate)<>'1900' 
+DELETE  FROM [TSA].[spExecutionLog] WHERE Start_Time< DATEADD(DAY,-3,GETDATE()) 
+INSERT INTO [TSA].[SalesForceControlTable_Log] (SourceObject,LastLoadDate,BeginTime,Username) values(@Table_name,GETDATE(),GETDATE(),SYSTEM_USER)
+  
+DECLARE @BatchSize AS INT=1000000, @BatchStart AS INT=1 ,@MaxRcount  AS INT, @IS_CTE AS INT=0;
+DECLARE @RoundUp DECIMAL=1000000
+DECLARE @Tbl_Count AS NVARCHAR(200)
+SET @Tbl_Count='Select @MaxRC=COUNT(ID) FROM [' +@Schema_name+'].['+@Table_name+']'
+EXEC sp_executeSQl @Tbl_Count, N'@MaxRC int output', @MaxRC = @MaxRcount output
+--SELECT @MaxRcount
+
+WHILE (@Exec_Order_Count>=@Row_Count)
+BEGIN  
+   SET @SqlQuery=(SELECT Query_Text FROM [TSA].[update_query_metadata] WHERE  table_name=@Table_name AND Execution_Order=@Row_Count AND Cycle=@Cycle)
+ IF(LEN(@SqlQuery)>0)  
+ BEGIN
+  IF(@SqlQuery NOT LIKE '%GROUP BY%')
+    SET @SQLQuery=@SQLQuery+' WHERE ['+ @Table_name+'].[lastmodifieddate] >='''+CONVERT(VARCHAR, @LastLoadDate, 20)+'''';
+  ELSE IF(@SqlQuery LIKE '%GROUP BY%' AND DATEPART(YEAR,@LastLoadDate) <>'1900')
+  BEGIN
+    SET @SQLQuery=REPLACE(@SQLQuery,'GROUP BY',' WHERE ['+ @Table_name+'].[lastmodifieddate] >='''+CONVERT(VARCHAR, @Week_Before_Date, 20)+''' GROUP BY ')
+    SET @SQLQuery=@SQLQuery+' WHERE ['+ @Table_name+'].[lastmodifieddate] >='''+CONVERT(VARCHAR, @LastLoadDate, 20)+'''';
+  END
+  ELSE IF(@SqlQuery LIKE '%GROUP BY%' AND DATEPART(YEAR,@LastLoadDate)= '1900')
+  BEGIN
+    SET @SQLQuery=@SQLQuery+' WHERE ['+ @Table_name+'].[lastmodifieddate] >='''+CONVERT(VARCHAR, @LastLoadDate, 20)+'''';
+	SET @IS_CTE=1
+  END
+  
+    
+      IF(DATEPART(YEAR,@LastLoadDate)= '1900')
+		  BEGIN
+		  INSERT INTO [TSA].[spExecutionLog](TableName,Execution_No,Start_Time,Username,Loaddate) values(@Table_name,@Row_Count,GETDATE(),SYSTEM_USER,@LastLoadDate)
+    
+		    WHILE( CEILING(@MaxRcount/@RoundUp)*@RoundUp>=@BatchStart   )
+		       BEGIN
+			   
+		        IF(@IS_CTE=1)
+		           BEGIN
+		             SET @SQLQuery=REPLACE(@SQLQuery,'WITH',' ')
+		             SET  @SQLQuery1=';with  '+@Table_name+'_copy '+'
+                                      as( SELECT  ID, RowID = ROW_NUMBER() OVER (ORDER BY '+@Table_name+'.Id ASC) FROM '+@Schema_Name+'.'+@Table_name+' (nolock)) ,'
+									  +REPLACE(@SQLQuery, 'WHERE','INNER JOIN '+@Table_name+'_copy '+' ON '+@Table_name+'_copy '+'.ID='+@Table_name+'.ID 
+                                      WHERE  '+@Table_name+'_copy '+'.RowID  >='+CONVERT(VARCHAR(10),@BatchStart)+' AND '+@Table_name+'_copy '+'.RowID <='+CONVERT(VARCHAR(10),@BatchSize)+'AND ')
+			
+		           END
+		        ELSE
+		           BEGIN
+                     SET  @SQLQuery1=';WITH  '+@Table_name+'_copy '+'
+                                      AS( SELECT  ID, RowID = ROW_NUMBER() OVER (ORDER BY ['+@Table_name+'].Id ASC) FROM '+@Schema_Name+'.['+@Table_name+'] (nolock))'
+									   +REPLACE(@SQLQuery, 'WHERE','INNER JOIN '+@Table_name+'_copy '+' ON '+@Table_name+'_copy '+'.ID=['+@Table_name+'].ID 
+                                      WHERE  '+@Table_name+'_copy'+'.RowID  >='+CONVERT(VARCHAR(10),@BatchStart)+' AND '+@Table_name+'_copy '+'.RowID <='+CONVERT(VARCHAR(10),@BatchSize)+'AND ')
+			
+		          END
+
+		   EXEC(@SQLQuery1);
+		   SET @SQLQuery1=''		   
+		   SET @BatchStart=@BatchStart+1000000;   /*Increment batch size and batch start no*/
+		   SET @BatchSize=@BatchSize+1000000;
+	
+		  END
+		   
+		     SET @MAX_Rws_Count= @@ROWCOUNT	
+		     UPDATE  [TSA].[spExecutionLog] SET End_Time=GETDATE() ,RowsInserted=@MaxRcount
+             WHERE TableName=@Table_name and ID=(SELECT max(ID) FROM TSA.[spExecutionLog] WHERE TableName=@Table_name)
+			 SET @BatchSize=1000000;  
+	         SET @BatchStart=1
+			 SET @IS_CTE=0
+		  END  
+	  
+
+    ELSE IF (DATEPART(YEAR,@LastLoadDate)<> '1900')
+	BEGIN
+	---insert with start date time for log 
+	INSERT INTO [TSA].[spExecutionLog](TableName,Execution_No,Start_Time,Username,Loaddate) values(@Table_name,@Row_Count,GETDATE(),SYSTEM_USER,@LastLoadDate)
+    
+    EXEC(@SQLQuery)
+    SET @MAX_Rws_Count= @@ROWCOUNT	
+	SET @SqlQuery=''  
+	
+	UPDATE  [TSA].[spExecutionLog] SET End_Time=GETDATE() ,RowsInserted=@MAX_Rws_Count
+    WHERE TableName=@Table_name and ID=(SELECT MAX(ID) FROM TSA.[spExecutionLog] WHERE TableName=@Table_name)
+	END
+
+ END  
+   SET @Row_Count=@Row_Count+1;  
+   
+END  	
+IF (DATEPART(YEAR,@LastLoadDate)<> '1900')
+EXEC('UPDATE ['+@Schema_Name+'].['+@Table_name+'] SET Last_SP_Ran_Date=GETDATE() WHERE ['+ @Table_name+'].[lastmodifieddate] >=CONVERT(VARCHAR, '''+@LastLoadDate+''', 20)')
+ELSE IF(DATEPART(YEAR,@LastLoadDate)= '1900')
+EXEC('UPDATE ['+@Schema_Name+'].['+@Table_name+'] SET Last_SP_Ran_Date=GETDATE()')
+
+ 
+
+UPDATE  [TSA].[SalesForceControlTable_Log] SET RowsInserted=CASE WHEN (DATEPART(YEAR,@LastLoadDate))='1900' THEN @MaxRcount ELSE @MAX_Rws_Count END,End_Time=GETDATE() 
+        WHERE SourceObject=@Table_name and ID=(SELECT max(ID) FROM TSA.[SalesForceControlTable_Log] WHERE SourceObject=@Table_name)
+END TRY
+BEGIN CATCH
+    INSERT INTO TSA.[ErrorLog] (UserName,ErrorNumber,ErrorState,ErrorLine,ErrorMessage,ErrorTime,TableName,ExecutionOrder )
+	VALUES
+	(	
+		SUSER_SNAME(),
+		ERROR_NUMBER(),
+		ERROR_STATE(),
+		ERROR_LINE(),
+		ERROR_MESSAGE(),
+		GETDATE(),
+		@Table_name,
+		@Row_Count
+	)
+
+END CATCH
+END  
+GO
+/****** Object:  StoredProcedure [TSA].[Update_Calculated_Cols_All_Tables]    Script Date: 2021-10-20 6:35:47 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+CREATE   PROCEDURE [TSA].[Update_Calculated_Cols_All_Tables]
+
+
+/************************ MODIFICATION LOG *************************************************
+Purpose: to update calculated columns for all tables.
+
+DATE          NAME                 MODIFICATION
+----------- ------- --------------------------------------------
+2021-08-24   Citrus             Initial Creation
+
+
+********************************************************************************************/
+--note: There is a dependency between the columns of the table. Hence the order in which the tables are updated is important and must not be changed. 
+--The order of execution is as follows:  User, Contact, Account, Task, opportunity, action_item, Project_Track, event, Lead.
+
+
+AS
+BEGIN
+
+EXEC [TSA].[Update_Calculated_cols] 'TSA','User',1,NULL;
+EXEC [TSA].[Update_Calculated_cols] 'TSA','Contact',1,NULL;
+EXEC [TSA].[Update_Calculated_cols] 'TSA','Account',1,NULL;
+EXEC [TSA].[Update_Calculated_cols] 'TSA','Task',1,NULL;
+EXEC [TSA].[Update_Calculated_cols] 'TSA','Opportunity',1,NULL;
+EXEC [TSA].[Update_Calculated_cols] 'TSA','Check_Request',1,NULL;
+--EXEC [TSA].[Update_Calculated_cols] 'TSA','Action_Item',1,NULL;
+EXEC [TSA].[Update_Calculated_cols] 'TSA','Project_Track',1,NULL;
+EXEC [TSA].[Update_Calculated_cols] 'TSA','Event',1,NULL;
+EXEC [TSA].[Update_Calculated_cols] 'TSA','Lead',1,NULL;
+--EXEC [TSA].[Update_Calculated_cols] 'TSA','Opportunity',2,NULL;
+--EXEC [TSA].[Update_Calculated_cols] 'TSA','Event',2,NULL;
+
+END
+GO
